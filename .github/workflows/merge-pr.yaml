@@ -32,7 +32,6 @@ permissions:
   contents: write
 
 env:
-  ORG_SHORT_NAME: sb
   AWS_REGION: us-east-1
 
 jobs:
