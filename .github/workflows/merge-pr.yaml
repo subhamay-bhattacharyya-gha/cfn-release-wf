@@ -1,5 +1,9 @@
-name: CloudFormation CI Reusable Workflow
-description: "Reusable workflow for CloudFormation CI/CD pipeline with validation, linting, scanning, building, and deployment capabilities"
+name: CloudFormation Merge PR (Reusable) Workflow
+description: |
+  This is a reusable GitHub Actions workflow for CI/CD merge pull request using CloudFormation.
+  It includes steps for linting, validating, scanning, and building AWS resources.
+  The workflow is designed to be triggered by other workflows or manually.
+  It also includes steps for checking environments, detecting changes, and preparing builds.
 
 on:
   workflow_call:
