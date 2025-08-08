@@ -137,10 +137,11 @@ jobs:
           echo "Template path: $TEMPLATE_PATH"
 
   cloudformation-validate:
-    name: "CloudFormation Validate"
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path).IaC == true }}
+    name: "✔️ CloudFormation Validate"
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
     needs: [execution-path]
-    if: needs.execution-path.outputs.template-path != ''
     outputs:
       tags: ${{ steps.check-artifact.outcome == 'success' && steps.read-existing-params.outputs.tags || steps.prepare-params.outputs.tags }}
     steps:
