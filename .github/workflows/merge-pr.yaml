@@ -35,9 +35,6 @@ permissions:
   id-token: write
   contents: write
 
-env:
-  AWS_REGION: us-east-1
-
 jobs:
   detect-changes:
     name: "🔎 Detect Changes"
