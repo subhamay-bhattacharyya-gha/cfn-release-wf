@@ -22,12 +22,6 @@ on:
       aws-role-arn:
         required: true
         description: "AWS role ARN for assuming a role."
-      infracost-api-key:
-        required: true
-        description: "API key for Infracost."
-      infracost-gist-id:
-        required: true
-        description: "Gist ID for Infracost output."
     outputs:
       template-path:
         description: "Path to the CloudFormation template file"
@@ -38,24 +32,18 @@ permissions:
   contents: write
 
 env:
-  ORG_SHORT_NAME: subhamay
+  ORG_SHORT_NAME: sb
   AWS_REGION: us-east-1
 
 jobs:
   detect-changes:
-    name: "Detect Changes"
+    name: "🔎 Detect Changes"
     runs-on: ubuntu-latest
-    if: github.ref != 'refs/heads/main'
     outputs:
       files-changed: ${{ steps.list-changed-files.outputs.files-changed }}
       json-output: ${{ steps.list-changed-files.outputs.json-output }}
       has-changes: ${{ steps.list-changed-files.outputs.has-changes }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: List updated files
         id: list-changed-files
         uses: subhamay-bhattacharyya-gha/list-updated-files-action@main
@@ -63,22 +51,42 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   detect-services:
-    name: "Detect Services"
+    name: 🔎 Detect Services
     runs-on: ubuntu-latest
     outputs:
-      services-used: ${{ steps.scan-services.outputs.services-used }}
+      services-used: ${{ steps.scan.outputs.services-used }}
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Scan for AWS services
-        id: scan-services
+      - name: Scan AWS Services
+        id: scan
         uses: subhamay-bhattacharyya-gha/scan-aws-services-action@main
-        with:
-          cfn-directory: ${{ inputs.cfn-directory }}
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          ORG_SHORT_NAME: ${{ env.ORG_SHORT_NAME }}
+
+      - name: Save Detected Services to Environment Variable
+        run: |
+          echo "Detected Services: ${{ steps.scan.outputs.services-used }}"
+          echo 'SERVICES_USED=${{ steps.scan.outputs.services-used }}' >> $GITHUB_ENV
+
+      - name: Print AWS Service Detection Table
+        run: |
+          echo "## AWS Services Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service               | Used |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------------------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "🔍 Raw SERVICES_USED: $SERVICES_USED"
+          node -e "
+          try {
+            const raw = process.env.SERVICES_USED;
+            const result = JSON.parse(raw);
+            const emoji = (val) => val ? '✅' : '❌';
+            const rows = Object.entries(result).map(([key, val]) => \`| \${key.padEnd(22)} | \${emoji(val)} |\`).join('\n');
+            require('fs').appendFileSync(process.env.GITHUB_STEP_SUMMARY, rows + '\n');
+          } catch (e) {
+            console.error('❌ Failed to parse SERVICES_USED:', e.message);
+            console.error('💥 Value received:', process.env.SERVICES_USED);
+            process.exit(1);
+          }"
 
   execution-path:
     name: "Execution Path"
@@ -90,13 +98,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Read CloudFormation template configuration
         id: read-config
@@ -140,722 +141,287 @@ jobs:
     runs-on: ubuntu-latest
     needs: [execution-path]
     if: needs.execution-path.outputs.template-path != ''
+    outputs:
+      tags: ${{ steps.check-artifact.outcome == 'success' && steps.read-existing-params.outputs.tags || steps.prepare-params.outputs.tags }}
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cloudformation-validation-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Validate CloudFormation template
-        run: |
-          echo "Validating CloudFormation template: ${{ needs.execution-path.outputs.template-path }}"
-          aws cloudformation validate-template --template-body file://${{ needs.execution-path.outputs.template-path }}
-          echo "CloudFormation template validation completed successfully"
-
-      - name: Upload deployment parameters
-        uses: actions/upload-artifact@v4
+      - name: Check for Existing Deployment Parameters Artifact
+        id: check-artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
-          name: deployment-parameters-validate
-          path: |
-            ${{ inputs.cfn-directory }}/**/*.json
-            ${{ inputs.cfn-directory }}/**/*.yaml
-            ${{ inputs.cfn-directory }}/**/*.yml
-          retention-days: 1
+          name: deployment-parameters
+          path: ./artifacts
+
+      - name: Prepare CloudFormation Parameters
+        id: prepare-params
+        if: steps.check-artifact.outcome == 'failure'
+        uses: subhamay-bhattacharyya-gha/cfn-stack-params-action@main
+        with:
+          cfn-directory: ${{ inputs.cfn-directory }}
+          ci-build: ${{ inputs.ci-build }}
+          environment: 'ci'
+
+      - name: Read Existing Deployment Parameters
+        id: read-existing-params
+        if: steps.check-artifact.outcome == 'success'
+        shell: bash
+        run: |
+          echo "📋 Using existing deployment parameters from artifact..."
+          if [ -f "./artifacts/deployment.json" ]; then
+            echo "✅ Found existing deployment.json file"
+            cat ./artifacts/deployment.json
+            
+            # Extract values from JSON
+            PARAMETERS=$(jq -c '.parameters' ./artifacts/deployment.json)
+            STACK_NAME=$(jq -r '."stack-name"' ./artifacts/deployment.json)
+            TEMPLATE_PATH=$(jq -r '."template-path"' ./artifacts/deployment.json)
+            TAGS=$(jq -c '.tags // {}' ./artifacts/deployment.json)
+            
+            echo "📋 Extracted Parameters from existing artifact:"
+            echo "Parameters: $PARAMETERS"
+            echo "Stack Name: $STACK_NAME"
+            echo "Template Path: $TEMPLATE_PATH"
+            echo "Tags: $TAGS"
+            
+            # Set as step outputs to match prepare-params outputs
+            echo "parameters=$PARAMETERS" >> $GITHUB_OUTPUT
+            echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
+            echo "template-path=$TEMPLATE_PATH" >> $GITHUB_OUTPUT
+            echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          else
+            echo "❌ deployment.json file not found in artifact"
+            exit 1
+          fi
+
+      - name: Print Stack Name
+        run: |
+          echo "Stack name:"
+          if [ "${{ steps.check-artifact.outcome }}" == "success" ]; then
+            echo "Stack Name (from existing artifact): ${{ steps.read-existing-params.outputs.stack-name }}"
+          else
+            echo "Stack Name (from prepared params): ${{ steps.prepare-params.outputs.stack-name }}"
+          fi
+          echo "Template Path : ${{ needs.execution-path.outputs.template-path }}"
+
+      - name: Validate CloudFormation Template
+        uses: subhamay-bhattacharyya-gha/cfn-validate-action@main
+        with:
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          cloudformation-dir: ${{ inputs.cfn-directory }}
+          template-file: ${{ needs.execution-path.outputs.template-path }}
+          aws-region: ${{ vars.AWS_REGION }}
 
   cloudformation-lint:
-    name: "CloudFormation Lint"
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path).IaC == true }}
+    name: 📋 CloudFormation Lint
     runs-on: ubuntu-latest
     needs: [execution-path]
-    if: needs.execution-path.outputs.template-path != ''
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.x'
 
       - name: Install cfn-lint
         run: |
           pip install cfn-lint
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Run CloudFormation Lint
+        uses: subhamay-bhattacharyya-gha/cfn-lint-action@main
         with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Lint CloudFormation template
-        run: |
-          echo "Linting CloudFormation template: ${{ needs.execution-path.outputs.template-path }}"
-          cfn-lint ${{ needs.execution-path.outputs.template-path }} --regions ${{ env.AWS_REGION }}
-          echo "CloudFormation template linting completed successfully"
-
-      - name: Upload deployment parameters
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-parameters-lint
-          path: |
-            ${{ inputs.cfn-directory }}/**/*.json
-            ${{ inputs.cfn-directory }}/**/*.yaml
-            ${{ inputs.cfn-directory }}/**/*.yml
-          retention-days: 1
+          template-path: ${{ needs.execution-path.outputs.template-path }}
 
   checkov-scan:
-    name: "Checkov Scan"
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path).IaC == true }}
+    name: 🧳 Checkov Scan
     runs-on: ubuntu-latest
     needs: [execution-path]
-    if: needs.execution-path.outputs.template-path != ''
-    continue-on-error: true
+    environment: ${{ inputs.environment }}
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install Checkov
-        run: |
-          pip install checkov
-
-      - name: Run Checkov scan
+      - name: Checkov Scan
+        uses: subhamay-bhattacharyya-gha/checkov-scan-action@main
         id: checkov-scan
-        run: |
-          echo "Running Checkov security scan on: ${{ needs.execution-path.outputs.template-path }}"
-          
-          # Create output directory
-          mkdir -p checkov-results
-          
-          # Run Checkov with SARIF output and continue on failure
-          checkov -f ${{ needs.execution-path.outputs.template-path }} \
-            --framework cloudformation \
-            --output sarif \
-            --output-file-path checkov-results/checkov-results.sarif \
-            --soft-fail || true
-          
-          # Also generate JSON output for report summarization
-          checkov -f ${{ needs.execution-path.outputs.template-path }} \
-            --framework cloudformation \
-            --output json \
-            --output-file-path checkov-results/checkov-results.json \
-            --soft-fail || true
-          
-          echo "Checkov security scan completed"
-
-      - name: Generate security report summary
-        id: report-summary
-        run: |
-          if [ -f "checkov-results/checkov-results.json" ]; then
-            echo "Generating security report summary..."
-            
-            # Extract key metrics from Checkov JSON output
-            PASSED_CHECKS=$(jq '.summary.passed // 0' checkov-results/checkov-results.json)
-            FAILED_CHECKS=$(jq '.summary.failed // 0' checkov-results/checkov-results.json)
-            SKIPPED_CHECKS=$(jq '.summary.skipped // 0' checkov-results/checkov-results.json)
-            TOTAL_CHECKS=$((PASSED_CHECKS + FAILED_CHECKS + SKIPPED_CHECKS))
-            
-            # Create summary report
-            cat > checkov-results/security-summary.md << EOF
-          # Security Scan Summary
-          
-          ## Checkov Results
-          - **Total Checks**: $TOTAL_CHECKS
-          - **Passed**: $PASSED_CHECKS
-          - **Failed**: $FAILED_CHECKS  
-          - **Skipped**: $SKIPPED_CHECKS
-          
-          ## Template Scanned
-          - **File**: ${{ needs.execution-path.outputs.template-path }}
-          - **Framework**: CloudFormation
-          
-          EOF
-            
-            # Add failed checks details if any
-            if [ "$FAILED_CHECKS" -gt 0 ]; then
-              echo "## Failed Checks" >> checkov-results/security-summary.md
-              jq -r '.results.failed_checks[]? | "- **\(.check_id)**: \(.check_name) (Severity: \(.severity // "UNKNOWN"))"' checkov-results/checkov-results.json >> checkov-results/security-summary.md
-            fi
-            
-            echo "Security report summary generated"
-            echo "summary-generated=true" >> $GITHUB_OUTPUT
-          else
-            echo "No Checkov results found"
-            echo "summary-generated=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload SARIF results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always() && steps.checkov-scan.conclusion != 'skipped'
         with:
-          sarif_file: checkov-results/checkov-results.sarif
-          category: checkov-security-scan
+          iac-dir: ${{ inputs.cfn-directory }}
+          iac-framework: cloudformation
+          soft-fail: true
 
-      - name: Upload security scan artifacts
-        uses: actions/upload-artifact@v4
-        if: always() && steps.checkov-scan.conclusion != 'skipped'
-        with:
-          name: security-scan-results
-          path: |
-            checkov-results/
-          retention-days: 7
-
-      - name: Display security summary
-        if: steps.report-summary.outputs.summary-generated == 'true'
+      - name: Confirm SARIF file type
+        shell: bash
         run: |
-          echo "Security scan completed. Summary:"
-          cat checkov-results/security-summary.md
+          ls -la "${{ github.workspace }}"
+          file "${{ github.workspace }}/results.sarif"
+
+      - name: "📋 Summarize and Print Checkov Scan Report with Snippets"
+        id: summarize-report
+        uses: subhamay-bhattacharyya-gha/checkov-report-action@main
 
   build-lambda:
-    name: "Build Lambda"
+    name: 🛠️ ⛔ Lambda Package
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path).lambda == true }}
     runs-on: ubuntu-latest
     needs: [execution-path, detect-services, detect-changes]
-    if: needs.execution-path.outputs.execution-path == 'deploy' && contains(needs.detect-services.outputs.services-used, 'Lambda')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Build Lambda functions
-        run: |
-          echo "Building Lambda functions..."
-          
-          # Find Lambda function directories
-          LAMBDA_DIRS=$(find . -name "lambda" -type d -o -name "functions" -type d -o -name "src" -type d | grep -v node_modules | grep -v .git)
-          
-          if [ -n "$LAMBDA_DIRS" ]; then
-            for dir in $LAMBDA_DIRS; do
-              if [ -f "$dir/requirements.txt" ] || [ -f "$dir/package.json" ] || [ -f "$dir/Pipfile" ]; then
-                echo "Building Lambda function in: $dir"
-                
-                # Create build directory
-                BUILD_DIR="$dir/build"
-                mkdir -p "$BUILD_DIR"
-                
-                # Handle Python dependencies
-                if [ -f "$dir/requirements.txt" ]; then
-                  echo "Installing Python dependencies for $dir"
-                  pip install -r "$dir/requirements.txt" -t "$BUILD_DIR"
-                  cp -r "$dir"/*.py "$BUILD_DIR/" 2>/dev/null || true
-                fi
-                
-                # Handle Node.js dependencies
-                if [ -f "$dir/package.json" ]; then
-                  echo "Installing Node.js dependencies for $dir"
-                  cd "$dir"
-                  npm install --production
-                  cd - > /dev/null
-                fi
-                
-                echo "Lambda function built successfully in: $BUILD_DIR"
-              fi
-            done
-          else
-            echo "No Lambda function directories found"
-          fi
-
-      - name: Upload Lambda build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-build-artifacts
-          path: |
-            **/lambda/build/
-            **/functions/build/
-            **/src/build/
-          retention-days: 1
+      - name: Build and Upload Lambda Package
+        run: echo "Uploading Lambda package..."
 
   build-lambda-layer:
-    name: "Build Lambda Layer"
+    name: 🛠️ ⛔ Lambda Layer
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path)['lambda-layer'] == true }}
     runs-on: ubuntu-latest
     needs: [execution-path, detect-services, detect-changes]
-    if: needs.execution-path.outputs.execution-path == 'deploy' && contains(needs.detect-services.outputs.services-used, 'Lambda')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Build Lambda Layer Package
+        run: echo "No changes in Lambda layer package, skipping build..."
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Build Lambda layers
-        run: |
-          echo "Building Lambda layers..."
-          
-          # Find Lambda layer directories
-          LAYER_DIRS=$(find . -name "layer" -type d -o -name "layers" -type d | grep -v node_modules | grep -v .git)
-          
-          if [ -n "$LAYER_DIRS" ]; then
-            for dir in $LAYER_DIRS; do
-              if [ -f "$dir/requirements.txt" ] || [ -f "$dir/package.json" ]; then
-                echo "Building Lambda layer in: $dir"
-                
-                # Create layer build directory with proper structure
-                BUILD_DIR="$dir/build"
-                mkdir -p "$BUILD_DIR/python/lib/python3.11/site-packages"
-                mkdir -p "$BUILD_DIR/nodejs/node_modules"
-                
-                # Handle Python layer dependencies
-                if [ -f "$dir/requirements.txt" ]; then
-                  echo "Installing Python layer dependencies for $dir"
-                  pip install -r "$dir/requirements.txt" -t "$BUILD_DIR/python/lib/python3.11/site-packages"
-                fi
-                
-                # Handle Node.js layer dependencies
-                if [ -f "$dir/package.json" ]; then
-                  echo "Installing Node.js layer dependencies for $dir"
-                  cd "$dir"
-                  npm install --production --prefix "$BUILD_DIR/nodejs"
-                  cd - > /dev/null
-                fi
-                
-                echo "Lambda layer built successfully in: $BUILD_DIR"
-              fi
-            done
-          else
-            echo "No Lambda layer directories found"
-          fi
-
-      - name: Upload Lambda layer build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-layer-build-artifacts
-          path: |
-            **/layer/build/
-            **/layers/build/
-          retention-days: 1
+      - name: Build and Upload Lambda Layer Package
+        run: echo "Build and Upload Lambda layer...."
 
   build-glue:
-    name: "Build Glue"
+    name: 🛠️ ⛔ Glue Script
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path).glue == true }}
     runs-on: ubuntu-latest
     needs: [execution-path, detect-services, detect-changes]
-    if: needs.execution-path.outputs.execution-path == 'deploy' && contains(needs.detect-services.outputs.services-used, 'Glue')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Package Glue Script
+        run: echo "No changes found in Glue script, skipping build..."
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Build Glue scripts
-        run: |
-          echo "Building Glue scripts..."
-          
-          # Find Glue script directories
-          GLUE_DIRS=$(find . -name "glue" -type d -o -name "scripts" -type d -o -name "etl" -type d | grep -v node_modules | grep -v .git)
-          
-          if [ -n "$GLUE_DIRS" ]; then
-            for dir in $GLUE_DIRS; do
-              echo "Processing Glue scripts in: $dir"
-              
-              # Create build directory
-              BUILD_DIR="$dir/build"
-              mkdir -p "$BUILD_DIR"
-              
-              # Copy Python scripts
-              find "$dir" -name "*.py" -exec cp {} "$BUILD_DIR/" \; 2>/dev/null || true
-              
-              # Handle dependencies if requirements.txt exists
-              if [ -f "$dir/requirements.txt" ]; then
-                echo "Installing Glue script dependencies for $dir"
-                pip install -r "$dir/requirements.txt" -t "$BUILD_DIR/lib"
-              fi
-              
-              # Package scripts into zip if multiple files
-              SCRIPT_COUNT=$(find "$BUILD_DIR" -name "*.py" | wc -l)
-              if [ "$SCRIPT_COUNT" -gt 1 ]; then
-                echo "Packaging Glue scripts into archive"
-                cd "$BUILD_DIR"
-                zip -r glue-scripts.zip *.py lib/ 2>/dev/null || zip -r glue-scripts.zip *.py
-                cd - > /dev/null
-              fi
-              
-              echo "Glue scripts processed successfully in: $BUILD_DIR"
-            done
-          else
-            echo "No Glue script directories found"
-          fi
-
-      - name: Upload Glue build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: glue-build-artifacts
-          path: |
-            **/glue/build/
-            **/scripts/build/
-            **/etl/build/
-          retention-days: 1
+      - name: Package and Upload Glue Script
+        run: echo "Uploading Glue script..."
 
   build-state-machine:
-    name: "Build State Machine"
+    name: 🛠️ ⛔ State Machine
+    if: ${{ needs.execution-path.result == 'success' && needs.execution-path.outputs.execution-path && fromJSON(needs.execution-path.outputs.execution-path)['state-machine'] == true }}
     runs-on: ubuntu-latest
     needs: [execution-path, detect-services, detect-changes]
-    if: needs.execution-path.outputs.execution-path == 'deploy' && contains(needs.detect-services.outputs.services-used, 'StepFunctions')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Package State Machine
+        run: echo "No changes in State Machine, skipping build."
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Build Step Functions state machines
-        run: |
-          echo "Building Step Functions state machines..."
-          
-          # Find state machine definition directories
-          SM_DIRS=$(find . -name "state-machine" -type d -o -name "step-functions" -type d -o -name "workflows" -type d | grep -v node_modules | grep -v .git)
-          
-          if [ -n "$SM_DIRS" ]; then
-            for dir in $SM_DIRS; do
-              echo "Processing state machines in: $dir"
-              
-              # Create build directory
-              BUILD_DIR="$dir/build"
-              mkdir -p "$BUILD_DIR"
-              
-              # Find and validate ASL (Amazon States Language) files
-              find "$dir" -name "*.json" -o -name "*.asl" | while read -r file; do
-                echo "Processing state machine definition: $file"
-                
-                # Validate JSON syntax
-                if jq empty "$file" 2>/dev/null; then
-                  echo "Valid JSON/ASL file: $file"
-                  cp "$file" "$BUILD_DIR/"
-                  
-                  # Extract state machine name from file
-                  BASENAME=$(basename "$file" .json)
-                  BASENAME=$(basename "$BASENAME" .asl)
-                  
-                  # Create a minified version for deployment
-                  jq -c . "$file" > "$BUILD_DIR/${BASENAME}.min.json"
-                  
-                else
-                  echo "Warning: Invalid JSON/ASL syntax in $file"
-                fi
-              done
-              
-              # Copy any additional configuration files
-              find "$dir" -name "*.yaml" -o -name "*.yml" -exec cp {} "$BUILD_DIR/" \; 2>/dev/null || true
-              
-              echo "State machines processed successfully in: $BUILD_DIR"
-            done
-          else
-            echo "No state machine directories found"
-          fi
-
-      - name: Upload state machine build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-machine-build-artifacts
-          path: |
-            **/state-machine/build/
-            **/step-functions/build/
-            **/workflows/build/
-          retention-days: 1
+      - name: Upload State Machine ASL
+        run: echo "Uploading State Machine ASL..."
 
   cloudformation-create:
-    name: "CloudFormation Create/Update"
+    if: ${{ needs.cloudformation-lint.result == 'success' && needs.cloudformation-validate.result == 'success' && needs.checkov-scan.result == 'success' }}
+    name: 🚧 CloudFormation Create Stack
     runs-on: ubuntu-latest
-    needs: [execution-path, cloudformation-validate, cloudformation-lint, checkov-scan, build-lambda, build-lambda-layer, build-glue, build-state-machine]
-    if: always() && needs.execution-path.outputs.execution-path == 'deploy' && needs.execution-path.outputs.template-path != '' && (needs.cloudformation-validate.result == 'success' || needs.cloudformation-validate.result == 'skipped') && (needs.cloudformation-lint.result == 'success' || needs.cloudformation-lint.result == 'skipped')
+    environment: ${{ inputs.environment }}
+    needs: [cloudformation-lint, cloudformation-validate, checkov-scan]
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Download Deployment Parameters Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-parameters
+          path: ./artifacts
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cloudformation-create-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Download deployment parameters
-        uses: actions/download-artifact@v4
-        with:
-          name: deployment-parameters-validate
-          path: ./artifacts/
-        continue-on-error: true
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-build-artifacts"
-          path: ./build-artifacts/
-          merge-multiple: true
-        continue-on-error: true
-
-      - name: Prepare deployment parameters
-        id: prepare-params
+      - name: Read Deployment Parameters
+        id: read-params
+        shell: bash
         run: |
-          echo "Preparing CloudFormation deployment parameters..."
-          
-          # Set stack name based on template and environment
-          TEMPLATE_NAME=$(basename "${{ needs.execution-path.outputs.template-path }}" .yaml)
-          TEMPLATE_NAME=$(basename "$TEMPLATE_NAME" .yml)
-          TEMPLATE_NAME=$(basename "$TEMPLATE_NAME" .json)
-          STACK_NAME="${{ env.ORG_SHORT_NAME }}-${TEMPLATE_NAME}-${{ inputs.environment }}"
-          
-          echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
-          echo "Stack name: $STACK_NAME"
-          
-          # Look for parameter files
-          PARAM_FILE=""
-          if [ -f "${{ inputs.cfn-directory }}/parameters-${{ inputs.environment }}.json" ]; then
-            PARAM_FILE="${{ inputs.cfn-directory }}/parameters-${{ inputs.environment }}.json"
-          elif [ -f "./artifacts/${{ inputs.cfn-directory }}/parameters-${{ inputs.environment }}.json" ]; then
-            PARAM_FILE="./artifacts/${{ inputs.cfn-directory }}/parameters-${{ inputs.environment }}.json"
-          elif [ -f "${{ inputs.cfn-directory }}/parameters.json" ]; then
-            PARAM_FILE="${{ inputs.cfn-directory }}/parameters.json"
-          elif [ -f "./artifacts/${{ inputs.cfn-directory }}/parameters.json" ]; then
-            PARAM_FILE="./artifacts/${{ inputs.cfn-directory }}/parameters.json"
-          fi
-          
-          if [ -n "$PARAM_FILE" ]; then
-            echo "parameter-file=$PARAM_FILE" >> $GITHUB_OUTPUT
-            echo "Using parameter file: $PARAM_FILE"
+          echo "📋 Reading deployment parameters from artifact..."
+          if [ -f "./artifacts/deployment.json" ]; then
+            echo "✅ Found deployment.json file"
+            cat ./artifacts/deployment.json
+            
+            # Extract values from JSON
+            PARAMETERS=$(jq -c '.parameters' ./artifacts/deployment.json)
+            STACK_NAME=$(jq -r '."stack-name"' ./artifacts/deployment.json)
+            TEMPLATE_PATH=$(jq -r '."template-path"' ./artifacts/deployment.json)
+            TAGS=$(jq -c '.tags // {}' ./artifacts/deployment.json)
+            
+            echo "📋 Extracted values from artifact:"
+            echo "Parameters: $PARAMETERS"
+            echo "Stack Name: $STACK_NAME"
+            echo "Template Path: $TEMPLATE_PATH"
+            echo "Tags: $TAGS"
+            
+            # Set as environment variables for use in subsequent steps
+            echo "DEPLOYMENT_PARAMETERS=$PARAMETERS" >> $GITHUB_ENV
+            echo "DEPLOYMENT_STACK_NAME=$STACK_NAME" >> $GITHUB_ENV
+            echo "DEPLOYMENT_TEMPLATE_PATH=$TEMPLATE_PATH" >> $GITHUB_ENV
+            echo "DEPLOYMENT_TAGS=$TAGS" >> $GITHUB_ENV
+            
+            # Set as step outputs
+            echo "parameters=$PARAMETERS" >> $GITHUB_OUTPUT
+            echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
+            echo "template-path=$TEMPLATE_PATH" >> $GITHUB_OUTPUT
+            echo "cloudformation-tags=$TAGS" >> $GITHUB_OUTPUT
           else
-            echo "No parameter file found"
-            echo "parameter-file=" >> $GITHUB_OUTPUT
-          fi
-          
-          # Set deployment capabilities
-          CAPABILITIES="CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
-          echo "capabilities=$CAPABILITIES" >> $GITHUB_OUTPUT
-
-      - name: Check if stack exists
-        id: check-stack
-        run: |
-          echo "Checking if CloudFormation stack exists: ${{ steps.prepare-params.outputs.stack-name }}"
-          
-          if aws cloudformation describe-stacks --stack-name "${{ steps.prepare-params.outputs.stack-name }}" >/dev/null 2>&1; then
-            echo "Stack exists, will update"
-            echo "stack-exists=true" >> $GITHUB_OUTPUT
-            echo "operation=update" >> $GITHUB_OUTPUT
-          else
-            echo "Stack does not exist, will create"
-            echo "stack-exists=false" >> $GITHUB_OUTPUT
-            echo "operation=create" >> $GITHUB_OUTPUT
+            echo "❌ deployment.json file not found in artifact"
+            exit 1
           fi
 
-      - name: Deploy CloudFormation stack
-        id: deploy-stack
-        run: |
-          echo "Deploying CloudFormation stack: ${{ steps.prepare-params.outputs.stack-name }}"
-          echo "Operation: ${{ steps.check-stack.outputs.operation }}"
-          echo "Template: ${{ needs.execution-path.outputs.template-path }}"
-          
-          # Prepare AWS CLI command
-          AWS_CMD="aws cloudformation deploy"
-          AWS_CMD="$AWS_CMD --template-file ${{ needs.execution-path.outputs.template-path }}"
-          AWS_CMD="$AWS_CMD --stack-name ${{ steps.prepare-params.outputs.stack-name }}"
-          AWS_CMD="$AWS_CMD --capabilities ${{ steps.prepare-params.outputs.capabilities }}"
-          
-          # Add parameter file if exists
-          if [ -n "${{ steps.prepare-params.outputs.parameter-file }}" ]; then
-            AWS_CMD="$AWS_CMD --parameter-overrides file://${{ steps.prepare-params.outputs.parameter-file }}"
-          fi
-          
-          # Add tags
-          AWS_CMD="$AWS_CMD --tags"
-          AWS_CMD="$AWS_CMD Environment=${{ inputs.environment }}"
-          AWS_CMD="$AWS_CMD Organization=${{ env.ORG_SHORT_NAME }}"
-          AWS_CMD="$AWS_CMD Repository=${{ github.repository }}"
-          AWS_CMD="$AWS_CMD Branch=${{ github.ref_name }}"
-          AWS_CMD="$AWS_CMD CommitSha=${{ github.sha }}"
-          AWS_CMD="$AWS_CMD WorkflowRun=${{ github.run_id }}"
-          
-          # Execute deployment
-          echo "Executing: $AWS_CMD"
-          eval $AWS_CMD
-          
-          # Get stack outputs
-          echo "Retrieving stack outputs..."
-          aws cloudformation describe-stacks \
-            --stack-name "${{ steps.prepare-params.outputs.stack-name }}" \
-            --query 'Stacks[0].Outputs' \
-            --output json > stack-outputs.json || echo "[]" > stack-outputs.json
-          
-          echo "CloudFormation deployment completed successfully"
-          echo "deployment-status=success" >> $GITHUB_OUTPUT
-
-      - name: Display stack outputs
-        if: steps.deploy-stack.outputs.deployment-status == 'success'
-        run: |
-          echo "CloudFormation Stack Outputs:"
-          if [ -f "stack-outputs.json" ]; then
-            cat stack-outputs.json | jq -r '.[] | "- \(.OutputKey): \(.OutputValue) (\(.Description // "No description"))"' || echo "No outputs available"
-          else
-            echo "No stack outputs file found"
-          fi
-
-      - name: Upload deployment artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Deploy CloudFormation Stack
+        uses: subhamay-bhattacharyya-gha/cfn-create-stack-action@main
         with:
-          name: cloudformation-deployment-artifacts
-          path: |
-            stack-outputs.json
-            ${{ steps.prepare-params.outputs.parameter-file }}
-          retention-days: 7
+          stack-name: ${{ steps.read-params.outputs.stack-name }}
+          template-path: ${{ steps.read-params.outputs.template-path }}
+          deployment-parameters: ${{ steps.read-params.outputs.parameters }}
+          cloudformation-tags: ${{ steps.read-params.outputs.cloudformation-tags }}
 
   cloudformation-delete:
-    name: "CloudFormation Delete"
+    if: ${{ needs.cloudformation-create.result == 'success' }}
+    name: ✂️ CloudFormation Destroy
     runs-on: ubuntu-latest
-    needs: [execution-path, cloudformation-create]
-    if: always() && needs.execution-path.outputs.execution-path == 'deploy' && inputs.environment == 'ci' && (needs.cloudformation-create.result == 'success' || needs.cloudformation-create.result == 'failure')
+    environment: ${{ inputs.environment }}
+    needs: [cloudformation-create]
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Download Deployment Parameters Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-parameters
+          path: ./artifacts
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
-          role-session-name: GitHubActions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cloudformation-delete-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Prepare cleanup parameters
-        id: prepare-cleanup
-        run: |
-          echo "Preparing CloudFormation cleanup parameters..."
-          
-          # Set stack name based on template and environment
-          TEMPLATE_NAME=$(basename "${{ needs.execution-path.outputs.template-path }}" .yaml)
-          TEMPLATE_NAME=$(basename "$TEMPLATE_NAME" .yml)
-          TEMPLATE_NAME=$(basename "$TEMPLATE_NAME" .json)
-          STACK_NAME="${{ env.ORG_SHORT_NAME }}-${TEMPLATE_NAME}-${{ inputs.environment }}"
-          
-          echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
-          echo "Stack name for cleanup: $STACK_NAME"
+      - name: Read Deployment Parameters
+        id: read-params
+        uses: subhamay-bhattacharyya-gha/cfn-read-deployment-params-action@main
+        with:
+          artifact-path: './artifacts/deployment.json'
 
-      - name: Wait before cleanup
-        run: |
-          echo "Waiting 30 seconds before cleanup to ensure stack is stable..."
-          sleep 30
-
-      - name: Check if stack exists for cleanup
-        id: check-cleanup-stack
-        run: |
-          echo "Checking if CloudFormation stack exists for cleanup: ${{ steps.prepare-cleanup.outputs.stack-name }}"
-          
-          if aws cloudformation describe-stacks --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}" >/dev/null 2>&1; then
-            STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}" --query 'Stacks[0].StackStatus' --output text)
-            echo "Stack exists with status: $STACK_STATUS"
-            echo "stack-exists=true" >> $GITHUB_OUTPUT
-            echo "stack-status=$STACK_STATUS" >> $GITHUB_OUTPUT
-            
-            # Only delete if stack is in a stable state
-            case $STACK_STATUS in
-              CREATE_COMPLETE|UPDATE_COMPLETE|ROLLBACK_COMPLETE|UPDATE_ROLLBACK_COMPLETE)
-                echo "Stack is in stable state, can proceed with deletion"
-                echo "can-delete=true" >> $GITHUB_OUTPUT
-                ;;
-              *)
-                echo "Stack is not in stable state, skipping deletion"
-                echo "can-delete=false" >> $GITHUB_OUTPUT
-                ;;
-            esac
-          else
-            echo "Stack does not exist, no cleanup needed"
-            echo "stack-exists=false" >> $GITHUB_OUTPUT
-            echo "can-delete=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Delete CloudFormation stack
-        if: steps.check-cleanup-stack.outputs.can-delete == 'true'
-        run: |
-          echo "Deleting CloudFormation stack: ${{ steps.prepare-cleanup.outputs.stack-name }}"
-          
-          # Initiate stack deletion
-          aws cloudformation delete-stack --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}"
-          
-          echo "Stack deletion initiated. Waiting for completion..."
-          
-          # Wait for deletion to complete (with timeout)
-          aws cloudformation wait stack-delete-complete \
-            --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}" \
-            --cli-read-timeout 1800 \
-            --cli-connect-timeout 60 || {
-            echo "Stack deletion wait timed out or failed, checking final status..."
-            
-            # Check if stack still exists
-            if aws cloudformation describe-stacks --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}" >/dev/null 2>&1; then
-              FINAL_STATUS=$(aws cloudformation describe-stacks --stack-name "${{ steps.prepare-cleanup.outputs.stack-name }}" --query 'Stacks[0].StackStatus' --output text)
-              echo "Stack still exists with status: $FINAL_STATUS"
-              
-              if [ "$FINAL_STATUS" = "DELETE_FAILED" ]; then
-                echo "Stack deletion failed. Manual intervention may be required."
-                exit 1
-              fi
-            else
-              echo "Stack successfully deleted"
-            fi
-          }
-          
-          echo "CloudFormation stack cleanup completed"
-
-      - name: Cleanup summary
-        if: always()
-        run: |
-          echo "CloudFormation Cleanup Summary:"
-          echo "- Environment: ${{ inputs.environment }}"
-          echo "- Stack Name: ${{ steps.prepare-cleanup.outputs.stack-name }}"
-          echo "- Stack Existed: ${{ steps.check-cleanup-stack.outputs.stack-exists }}"
-          echo "- Could Delete: ${{ steps.check-cleanup-stack.outputs.can-delete }}"
-          if [ "${{ steps.check-cleanup-stack.outputs.stack-exists }}" = "true" ]; then
-            echo "- Stack Status: ${{ steps.check-cleanup-stack.outputs.stack-status }}"
-          fi
+      - name: CloudFormation Delete Stack
+        uses: subhamay-bhattacharyya-gha/cfn-delete-stack-action@main
+        with:
+          stack-name: ${{ env.DEPLOYMENT_STACK_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
 
   create-release:
     name: "Create Release"

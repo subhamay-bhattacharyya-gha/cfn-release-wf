@@ -89,17 +89,7 @@ else
     log_error "aws-role-arn secret is missing"
 fi
 
-if grep -A 15 "secrets:" "$WORKFLOW_FILE" | grep -q "infracost-api-key:"; then
-    log_success "infracost-api-key secret is defined"
-else
-    log_error "infracost-api-key secret is missing"
-fi
-
-if grep -A 15 "secrets:" "$WORKFLOW_FILE" | grep -q "infracost-gist-id:"; then
-    log_success "infracost-gist-id secret is defined"
-else
-    log_error "infracost-gist-id secret is missing"
-fi
+# Infracost secrets removed as per requirements
 
 echo ""
 echo "6. Validating outputs configuration..."
